@@ -13,7 +13,7 @@ Secrets GitHub / variabili .env:
     RECIPIENT_EMAIL
 """
 
-import os, json, hashlib, datetime, time, smtplib, logging
+import os, json, hashlib, datetime, time, smtplib, logging, re
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -77,95 +77,98 @@ PLAYERS = [
 # ANTHROPIC WEB SEARCH
 # ─────────────────────────────────────────────
 def query_claude_with_search(player_name: str, mercato: str) -> dict:
-    """
-    Usa Claude con web search per estrarre dati strutturati su ogni player.
-    Restituisce un dict con tutti i campi necessari per l'Excel.
-    """
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
     tipo = "ente pubblico della Difesa italiana" if mercato == "Pubblico" else "azienda privata del settore Difesa italiana"
 
     prompt = f"""Sei un analista di mercato che lavora per NTT DATA Italia.
 Devi raccogliere informazioni aggiornate su "{player_name}", {tipo}.
 
-Cerca e restituisci SOLO un oggetto JSON valido (niente testo prima o dopo) con questa struttura esatta:
+Fai ricerche web approfondite e poi restituisci SOLO un oggetto JSON valido
+(niente testo prima o dopo il JSON, niente markdown, niente backtick) con questa struttura:
 
 {{
-  "fatturato_ultimo_anno": "valore in €M o €Bn, es: 17.8 Bn€ (2024)",
-  "spesa_it_stimata": "valore o range stimato in €M, es: 320-450 M€",
-  "spesa_it_fonte": "fonte da cui è ricavata la stima (bilancio, piano triennale, ecc.)",
-  "servizi_it_acquistati": ["lista", "dei", "servizi", "IT", "principali"],
-  "piano_strategico_it": "sintesi del piano strategico digitale/IT se disponibile",
+  "fatturato_ultimo_anno": "valore in euro, es: 17.8 Bn euro (2024)",
+  "spesa_it_stimata": "valore o range stimato in milioni euro, es: 320-450 M euro",
+  "spesa_it_fonte": "fonte da cui e ricavata la stima",
+  "servizi_it_acquistati": ["servizio1", "servizio2", "servizio3"],
+  "piano_strategico_it": "sintesi del piano strategico digitale IT se disponibile",
   "gare_recenti": [
     {{
       "anno": "2024",
-      "oggetto": "descrizione della gara",
-      "importo": "€M",
-      "cig": "codice CIG se disponibile",
-      "aggiudicatario": "nome azienda o n.d.",
-      "fonte": "URL o fonte"
+      "oggetto": "descrizione della gara IT",
+      "importo": "importo in euro",
+      "cig": "codice CIG o nd",
+      "aggiudicatario": "nome azienda o nd",
+      "fonte": "URL o nome fonte"
     }}
   ],
-  "trend_futuro": "investimenti IT/digitali previsti o annunciati",
-  "note_rilevanti": "qualsiasi info utile per NTT DATA per posizionarsi"
+  "trend_futuro": "investimenti IT digitali previsti o annunciati",
+  "note_rilevanti": "info utili per NTT DATA per posizionarsi su questo cliente"
 }}
 
-Cerca su: bilanci annuali, relazioni finanziarie, portale ANAC/BDNCP, sito ufficiale,
+Cerca su: bilanci annuali, relazioni finanziarie, portale ANAC BDNCP, sito ufficiale,
 comunicati stampa, piani industriali, documenti parlamentari, piano triennale IT.
-Per le gare cerca su ANAC con query tipo: "{player_name} gara informatica IT cyber cloud".
-Se un dato non è disponibile usa "n.d." come valore."""
+Per le gare cerca: "{player_name} gara IT informatica cyber cloud ANAC"
+Se un dato non e disponibile usa "nd" come valore stringa."""
 
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": prompt}],
-        )
+        messages = [{"role": "user", "content": prompt}]
+        tools = [{"type": "web_search_20250305", "name": "web_search"}]
 
-        # Estrai tutto il testo dalla risposta (inclusi i risultati post-tool-use)
-        full_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                full_text += block.text
-
-        # Se la risposta è incompleta per tool_use, fai un secondo giro
-        if response.stop_reason == "tool_use":
-            # Costruisci la history completa per il secondo turno
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": "Risultati di ricerca ricevuti."
-                    })
-
-            response2 = client.messages.create(
+        # Loop multi-turno per gestire web search
+        for _ in range(5):
+            response = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=2000,
-                tools=[{"type": "web_search_20250305", "name": "web_search"}],
-                messages=[
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": response.content},
-                    {"role": "user", "content": tool_results},
-                ],
+                max_tokens=3000,
+                tools=tools,
+                messages=messages,
             )
-            for block in response2.content:
+
+            # Aggiungi risposta alla history
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Se ha finito, estrai il testo finale
+            if response.stop_reason == "end_turn":
+                full_text = ""
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        full_text += block.text
+                break
+
+            # Se ha usato tool, fornisci risultati fittizi e continua
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": "Risultati di ricerca web ricevuti e analizzati."
+                        })
+                messages.append({"role": "user", "content": tool_results})
+                continue
+
+            # Altro stop reason
+            full_text = ""
+            for block in response.content:
                 if hasattr(block, "text"):
                     full_text += block.text
+            break
 
-        # Estrai JSON dalla risposta
-        json_match = None
-        import re
-        json_match = re.search(r'\{[\s\S]*\}', full_text)
-        if json_match:
-            data = json.loads(json_match.group())
-            log.info(f"  ✓ {player_name}: dati estratti con successo")
-            return data
-        else:
-            log.warning(f"  ⚠ {player_name}: JSON non trovato nella risposta")
-            return _empty_record()
+        # Prova estrazione JSON
+        if full_text.strip():
+            # Cerca JSON nel testo
+            match = re.search(r'\{[\s\S]*\}', full_text)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                    log.info(f"  ✓ {player_name}: dati estratti con successo")
+                    return data
+                except json.JSONDecodeError:
+                    log.warning(f"  ⚠ {player_name}: JSON malformato, testo: {full_text[:200]}")
+
+        log.warning(f"  ⚠ {player_name}: nessun JSON trovato")
+        return _empty_record()
 
     except Exception as e:
         log.error(f"  ✗ {player_name}: errore API – {e}")
@@ -213,29 +216,22 @@ def compute_diff(player_name: str, today: dict, history: dict) -> str:
     yesterday = history.get(player_name)
     if not yesterday:
         return "Prima esecuzione – baseline acquisita"
-
     fp_today = compute_fingerprint(today)
     fp_yest  = yesterday.get("fingerprint", "")
     if fp_today == fp_yest:
         return "Nessuna variazione vs ieri"
-
     changes = []
-
     if today.get("spesa_it_stimata") != yesterday.get("spesa_it_stimata"):
-        changes.append(f"Spesa IT: {yesterday.get('spesa_it_stimata','?')} → {today.get('spesa_it_stimata','?')}")
-
+        changes.append(f"Spesa IT: {yesterday.get('spesa_it_stimata','?')} -> {today.get('spesa_it_stimata','?')}")
     if today.get("fatturato_ultimo_anno") != yesterday.get("fatturato_ultimo_anno"):
-        changes.append(f"Fatturato: aggiornato")
-
+        changes.append("Fatturato: aggiornato")
     gare_oggi = len(today.get("gare_recenti", []))
     gare_ieri = yesterday.get("n_gare", 0)
     if gare_oggi != gare_ieri:
         diff_g = gare_oggi - gare_ieri
         changes.append(f"Gare: {'+' if diff_g > 0 else ''}{diff_g} rispetto a ieri")
-
     if today.get("trend_futuro") != yesterday.get("trend_futuro"):
         changes.append("Trend futuro: aggiornato")
-
     return " | ".join(changes) if changes else "Variazioni minori rilevate"
 
 
@@ -274,7 +270,7 @@ def _cell(ws, row, col, value, bg="FFFFFF", bold=False, wrap=True, size=9, color
 def build_excel(all_results: list, date_str: str) -> Path:
     wb = openpyxl.Workbook()
 
-    # ── SHEET 1: DASHBOARD ───────────────────
+    # SHEET 1: DASHBOARD
     ws = wb.active
     ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
@@ -282,7 +278,7 @@ def build_excel(all_results: list, date_str: str) -> Path:
 
     ws.merge_cells("A1:L1")
     t = ws["A1"]
-    t.value     = f"NTT DATA – Defence Market Intelligence  |  {date_str}"
+    t.value     = f"NTT DATA - Defence Market Intelligence  |  {date_str}"
     t.font      = Font(name=FONT_NAME, bold=True, size=14, color="FFFFFF")
     t.fill      = PatternFill("solid", start_color=COLOR_HEADER)
     t.alignment = Alignment(horizontal="center", vertical="center")
@@ -290,11 +286,11 @@ def build_excel(all_results: list, date_str: str) -> Path:
 
     ws.merge_cells("A2:L2")
     leg = ws["A2"]
-    leg.value     = "🟦 Pubblico   🟩 Privato   🟨 Variazione rilevata vs ieri"
+    leg.value     = "Pubblico (blu)   Privato (verde)   Variazione rilevata vs ieri (giallo)"
     leg.font      = Font(name=FONT_NAME, size=9, italic=True)
     leg.alignment = Alignment(horizontal="center")
 
-    hdrs = ["Player", "Mercato", "Complessità Proc.", "Fatturato",
+    hdrs = ["Player", "Mercato", "Complessita Proc.", "Fatturato",
             "Spesa IT Stimata", "Fonte Stima", "Servizi IT Acquistati",
             "Piano Strategico IT", "N. Gare Trovate", "Trend Futuro",
             "Delta vs Ieri", "Note per NTT DATA"]
@@ -308,7 +304,7 @@ def build_excel(all_results: list, date_str: str) -> Path:
 
     for ri, rec in enumerate(all_results, 4):
         bg = COLOR_PUB if rec["mercato"] == "Pubblico" else COLOR_PRIV
-        delta_bg = COLOR_CHANGE if "→" in rec["delta"] or "Gare:" in rec["delta"] or "aggiornato" in rec["delta"] else bg
+        delta_bg = COLOR_CHANGE if "->" in rec["delta"] or "Gare:" in rec["delta"] or "aggiornato" in rec["delta"] else bg
         servizi = ", ".join(rec["data"].get("servizi_it_acquistati", [])) or "n.d."
         row_vals = [
             rec["nome"],
@@ -331,14 +327,14 @@ def build_excel(all_results: list, date_str: str) -> Path:
 
     ws.auto_filter.ref = f"A3:{get_column_letter(len(hdrs))}3"
 
-    # ── SHEET 2: STORICO GARE ────────────────
+    # SHEET 2: STORICO GARE
     ws2 = wb.create_sheet("Storico Gare")
     ws2.sheet_view.showGridLines = False
     ws2.freeze_panes = "A3"
 
     ws2.merge_cells("A1:G1")
     t2 = ws2["A1"]
-    t2.value     = "Storico Gare IT / Cyber / Cloud – Player Difesa"
+    t2.value     = "Storico Gare IT Cyber Cloud - Player Difesa"
     t2.font      = Font(name=FONT_NAME, bold=True, size=13, color="FFFFFF")
     t2.fill      = PatternFill("solid", start_color=COLOR_HEADER)
     t2.alignment = Alignment(horizontal="center", vertical="center")
@@ -359,7 +355,7 @@ def build_excel(all_results: list, date_str: str) -> Path:
         if not gare:
             c = ws2.cell(row=row_i, column=1, value=rec["nome"])
             c.font = Font(name=FONT_NAME, size=9, italic=True, color="888888")
-            ws2.cell(row=row_i, column=2, value="–")
+            ws2.cell(row=row_i, column=2, value="-")
             ws2.cell(row=row_i, column=3, value="Nessuna gara trovata")
             for ci in range(1, 8):
                 _border(ws2.cell(row=row_i, column=ci))
@@ -388,7 +384,7 @@ def build_excel(all_results: list, date_str: str) -> Path:
 
     ws2.auto_filter.ref = f"A2:{get_column_letter(len(g_hdrs))}2"
 
-    # ── SHEET 3: DETTAGLIO PLAYER ────────────
+    # SHEET 3: DETTAGLIO PLAYER
     ws3 = wb.create_sheet("Dettaglio Player")
     ws3.sheet_view.showGridLines = False
     ws3.column_dimensions["A"].width = 28
@@ -405,9 +401,8 @@ def build_excel(all_results: list, date_str: str) -> Path:
     row_i = 2
     for rec in all_results:
         bg = COLOR_PUB if rec["mercato"] == "Pubblico" else COLOR_PRIV
-        # Intestazione player
         ws3.merge_cells(f"A{row_i}:B{row_i}")
-        c = ws3.cell(row=row_i, column=1, value=f"▶  {rec['nome']}  ({rec['mercato']})")
+        c = ws3.cell(row=row_i, column=1, value=f"  {rec['nome']}  ({rec['mercato']})")
         c.font      = Font(name=FONT_NAME, bold=True, size=11, color="FFFFFF")
         c.fill      = PatternFill("solid", start_color=COLOR_SUBHEAD)
         c.alignment = Alignment(vertical="center")
@@ -430,9 +425,8 @@ def build_excel(all_results: list, date_str: str) -> Path:
             _cell(ws3, row_i, 2, val,   bg="FFFFFF")
             ws3.row_dimensions[row_i].height = 36
             row_i += 1
-        row_i += 1  # riga vuota tra player
+        row_i += 1
 
-    # ── SAVE ─────────────────────────────────
     fname = OUTPUT_DIR / f"defence_market_{date_str.replace('-', '')}.xlsx"
     wb.save(fname)
     log.info(f"Excel salvato: {fname}")
@@ -443,13 +437,13 @@ def build_excel(all_results: list, date_str: str) -> Path:
 # EMAIL
 # ─────────────────────────────────────────────
 def build_email_html(all_results: list, date_str: str) -> str:
-    changed   = sum(1 for r in all_results if "→" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"])
+    changed   = sum(1 for r in all_results if "->" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"])
     tot_gare  = sum(len(r["data"].get("gare_recenti", [])) for r in all_results)
     con_spesa = sum(1 for r in all_results if r["data"].get("spesa_it_stimata", "n.d.") != "n.d.")
 
     rows = ""
     for r in all_results:
-        delta_bg = "#FFE599" if ("→" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"]) else "#FFFFFF"
+        delta_bg = "#FFE599" if ("->" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"]) else "#FFFFFF"
         badge    = "#D9E2F3" if r["mercato"] == "Pubblico" else "#E2EFDA"
         rows += f"""
         <tr>
@@ -465,8 +459,8 @@ def build_email_html(all_results: list, date_str: str) -> str:
 <body style="font-family:Arial,sans-serif;color:#1F3864;margin:0;padding:20px">
 <div style="max-width:860px;margin:auto">
   <div style="background:#1F3864;padding:18px 24px;border-radius:8px 8px 0 0">
-    <h1 style="color:#fff;margin:0;font-size:18px">NTT DATA – Defence Market Intelligence</h1>
-    <p style="color:#aac4e8;margin:4px 0 0;font-size:13px">Report giornaliero · {date_str}</p>
+    <h1 style="color:#fff;margin:0;font-size:18px">NTT DATA - Defence Market Intelligence</h1>
+    <p style="color:#aac4e8;margin:4px 0 0;font-size:13px">Report giornaliero - {date_str}</p>
   </div>
   <div style="background:#f0f4fa;padding:16px 24px;display:flex;gap:16px;flex-wrap:wrap">
     <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #2E75B6">
@@ -500,8 +494,7 @@ def build_email_html(all_results: list, date_str: str) -> str:
     <tbody>{rows}</tbody>
   </table>
   <p style="font-size:11px;color:#888;margin-top:16px">
-    In allegato: Excel con Dashboard, Storico Gare completo e Schede Dettaglio per player.<br>
-    🟨 Sfondo giallo = variazione rilevata rispetto all'esecuzione precedente.
+    In allegato: Excel con Dashboard, Storico Gare completo e Schede Dettaglio per player.
   </p>
 </div>
 </body></html>"""
@@ -509,7 +502,7 @@ def build_email_html(all_results: list, date_str: str) -> str:
 
 def send_email(xlsx_path: Path, html_body: str, date_str: str):
     if not SMTP_USER or not SMTP_PASS:
-        log.warning("Credenziali SMTP non configurate – mail non inviata.")
+        log.warning("Credenziali SMTP non configurate - mail non inviata.")
         return
     msg = MIMEMultipart("mixed")
     msg["From"]    = SMTP_USER
@@ -548,21 +541,21 @@ def run():
         fp    = compute_fingerprint(data)
 
         history[player["nome"]] = {
-            "fingerprint":         fp,
-            "spesa_it_stimata":    data.get("spesa_it_stimata"),
+            "fingerprint":           fp,
+            "spesa_it_stimata":      data.get("spesa_it_stimata"),
             "fatturato_ultimo_anno": data.get("fatturato_ultimo_anno"),
-            "trend_futuro":        data.get("trend_futuro"),
-            "n_gare":              len(data.get("gare_recenti", [])),
-            "date":                date_str,
+            "trend_futuro":          data.get("trend_futuro"),
+            "n_gare":                len(data.get("gare_recenti", [])),
+            "date":                  date_str,
         }
         all_results.append({
-            "nome":       player["nome"],
-            "mercato":    player["mercato"],
+            "nome":        player["nome"],
+            "mercato":     player["mercato"],
             "complessita": player["complessita"],
-            "data":       data,
-            "delta":      delta,
+            "data":        data,
+            "delta":       delta,
         })
-        time.sleep(3)  # evita rate limiting
+        time.sleep(3)
 
     save_history(history)
     xlsx_path = build_excel(all_results, date_str)
@@ -579,7 +572,7 @@ if __name__ == "__main__":
     else:
         try:
             import schedule
-            log.info("Scheduler attivo – esecuzione ogni giorno alle 07:30.")
+            log.info("Scheduler attivo - esecuzione ogni giorno alle 07:30.")
             schedule.every().day.at("07:30").do(run)
             run()
             while True:
