@@ -1,34 +1,30 @@
 """
 Defence Market Analysis – NTT DATA Italy
-Daily scraper: raccoglie dati sui player del segmento Difesa,
-genera un Excel di sintesi e invia una mail di aggiornamento.
+Script giornaliero con Anthropic API + web search integrato.
+Raccoglie: budget IT, spesa digitale, storico gare ANAC per ogni player.
+Genera Excel strutturato e invia mail con delta vs giorno precedente.
 
 Requisiti:
-    pip install requests beautifulsoup4 openpyxl schedule python-dotenv
+    pip install anthropic openpyxl python-dotenv
 
-Variabili d'ambiente (file .env):
-    ANTHROPIC_API_KEY   – chiave API Anthropic (usata per parsing intelligente)
-    SMTP_HOST           – es. smtp.office365.com
-    SMTP_PORT           – es. 587
-    SMTP_USER           – indirizzo mittente
-    SMTP_PASS           – password / app-password
-    RECIPIENT_EMAIL     – jacopo.roccella@nttdata.com
+Secrets GitHub / variabili .env:
+    ANTHROPIC_API_KEY
+    SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS
+    RECIPIENT_EMAIL
 """
 
-import os, json, re, smtplib, hashlib, datetime, time, logging
+import os, json, hashlib, datetime, time, smtplib, logging
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-import requests
-from bs4 import BeautifulSoup
+import anthropic
 import openpyxl
-from openpyxl.styles import (
-    Font, PatternFill, Alignment, Border, Side, numbers
-)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -38,11 +34,12 @@ except ImportError:
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "jacopo.roccella@nttdata.com")
-SMTP_HOST       = os.getenv("SMTP_HOST", "smtp.office365.com")
-SMTP_PORT       = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER       = os.getenv("SMTP_USER", "")
-SMTP_PASS       = os.getenv("SMTP_PASS", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+RECIPIENT_EMAIL   = os.getenv("RECIPIENT_EMAIL", "jacopo.roccella@nttdata.com")
+SMTP_HOST         = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT         = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER         = os.getenv("SMTP_USER", "")
+SMTP_PASS         = os.getenv("SMTP_PASS", "")
 
 DATA_DIR   = Path("./data")
 OUTPUT_DIR = Path("./output")
@@ -63,227 +60,129 @@ log = logging.getLogger(__name__)
 # PLAYER DEFINITIONS
 # ─────────────────────────────────────────────
 PLAYERS = [
-    {
-        "nome":     "Ministero della Difesa",
-        "mercato":  "Pubblico",
-        "ruolo":    "Buyer centrale – definisce fabbisogni e indirizzi",
-        "complessita_procurement": "Molto Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.difesa.it/content/statoprevisionespesa/26765.html",
-            "https://www.difesa.it/assets/allegati/3754/piano_di_analisi_e_valutazione_della_spesa_2025-2027_del_ministero_della_difesa.pdf",
-            "https://www.difesa.it/primopiano/il-ministero-della-difesa-sceglie-il-cloud-di-polo-strategico-nazionale/53268.html",
-        ],
-        "servizi_it": ["Cloud (PSN)", "Cybersecurity", "Data", "Legacy migration",
-                       "Applicativi", "Governance IT"],
-    },
-    {
-        "nome":     "Forze Armate",
-        "mercato":  "Pubblico",
-        "ruolo":    "Utenti/committenti operativi",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.senato.it/service/PDF/PDFServer/BGT/001484480.pdf",
-            "https://pubblicitalegale.anticorruzione.it/bdncp",
-        ],
-        "servizi_it": ["Infrastrutture", "Reti", "SOC", "Collaboration",
-                       "Mobile", "Training", "Mission-support systems"],
-    },
-    {
-        "nome":     "Difesa Servizi",
-        "mercato":  "Pubblico",
-        "ruolo":    "In-house del Ministero – valorizza asset e gestisce iniziative",
-        "complessita_procurement": "Media",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.difesaservizi.it/gare",
-        ],
-        "servizi_it": ["Servizi digitali", "Comunicazione", "Piattaforme",
-                       "Procurement indiretto"],
-    },
-    {
-        "nome":     "Esercito / Marina / Aeronautica",
-        "mercato":  "Pubblico",
-        "ruolo":    "Branch operativi con esigenze specifiche",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.esercito.difesa.it/comunicazione/bandi-di-gara-esercito/bandi-di-gara/126748.html",
-            "https://www.marina.difesa.it/Pagine/default.aspx",
-            "https://www.aeronautica.difesa.it/",
-        ],
-        "servizi_it": ["Postazioni", "Reti", "SOC", "Analytics",
-                       "Manutenzione", "Training", "Collaboration"],
-    },
-    {
-        "nome":     "Segretariato Generale Difesa / DNA",
-        "mercato":  "Pubblico",
-        "ruolo":    "Hub amministrativo-tecnico e programmatico",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.difesa.it/assets/allegati/3754/piano_di_analisi_e_valutazione_della_spesa_2025-2027_del_ministero_della_difesa.pdf",
-            "https://pubblicitalegale.anticorruzione.it/bandi",
-        ],
-        "servizi_it": ["Program management", "Procurement support",
-                       "Document management", "Compliance", "Architecture"],
-    },
-    {
-        "nome":     "Leonardo",
-        "mercato":  "Privato",
-        "ruolo":    "Prime contractor e integratore strategico",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": 17.8,
-        "fonti": [
-            "https://www.leonardo.com/en/investors/results-and-reports",
-            "https://cybersecurity.leonardo.com/en/digitalisation",
-            "https://www.leonardo.com/documents/15646808/0/2024+Integrated+Annual+Report.pdf",
-        ],
-        "servizi_it": ["Cyber", "Cloud", "Data", "Software engineering",
-                       "Digital HMI", "Consulenza specialistica"],
-    },
-    {
-        "nome":     "Fincantieri",
-        "mercato":  "Privato",
-        "ruolo":    "Prime contractor navale e industriale",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": 9.19,
-        "fonti": [
-            "https://www.fincantieri.com/it/investor-relations/dati-documenti-e-financial-highlights/dati-finanziari",
-            "https://www.fincantieri.com/en/business/products/systems--components-e-infrastructures/cybersecurity",
-        ],
-        "servizi_it": ["OT security", "e-Procurement", "PLM",
-                       "Digital shipyard", "Cyber resilience", "Data"],
-    },
-    {
-        "nome":     "MBDA Italia",
-        "mercato":  "Privato",
-        "ruolo":    "Missile/defence systems – programmi complessi",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.mbda-systems.com/sites/mbda/files/2025-06/mbda_sustainability-report-2024_webfriendly.pdf",
-        ],
-        "servizi_it": ["PLM", "Engineering collaboration", "Security",
-                       "Testing", "Systems integration"],
-    },
-    {
-        "nome":     "Elettronica Group",
-        "mercato":  "Privato",
-        "ruolo":    "Elettronica per difesa ed EW",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.eltgroup.net/",
-        ],
-        "servizi_it": ["Secure engineering", "Data", "Manufacturing digitalization",
-                       "Cyber OT/IT", "Compliance"],
-    },
-    {
-        "nome":     "Thales Alenia Space Italia",
-        "mercato":  "Privato",
-        "ruolo":    "Spazio dual-use – mission-critical",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.thalesaleniaspace.com/en",
-        ],
-        "servizi_it": ["Cloud", "Data", "AI", "Cyber",
-                       "Digital engineering", "Simulazione"],
-    },
-    {
-        "nome":     "Avio Aero",
-        "mercato":  "Privato",
-        "ruolo":    "Industrial aerospace/defence supply chain",
-        "complessita_procurement": "Alta",
-        "fatturato_bn": None,
-        "fonti": [
-            "https://www.avioaero.com/",
-        ],
-        "servizi_it": ["ERP", "MES", "PLM", "Analytics",
-                       "Quality", "Supply chain", "Cyber OT/IT"],
-    },
-]
-
-# Fonti per gare/procurement
-PROCUREMENT_SOURCES = [
-    "https://pubblicitalegale.anticorruzione.it/bdncp",
-    "https://www.difesaservizi.it/gare",
+    {"nome": "Ministero della Difesa",              "mercato": "Pubblico",  "complessita": "Molto Alta"},
+    {"nome": "Forze Armate (Esercito/Marina/AM)",   "mercato": "Pubblico",  "complessita": "Alta"},
+    {"nome": "Difesa Servizi",                      "mercato": "Pubblico",  "complessita": "Media"},
+    {"nome": "Segretariato Generale Difesa / DNA",  "mercato": "Pubblico",  "complessita": "Alta"},
+    {"nome": "Leonardo",                            "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "Fincantieri",                         "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "MBDA Italia",                         "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "Elettronica Group",                   "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "Thales Alenia Space Italia",          "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "Avio Aero",                           "mercato": "Privato",   "complessita": "Alta"},
+    {"nome": "Leonardo DRS",                        "mercato": "Privato",   "complessita": "Alta"},
 ]
 
 # ─────────────────────────────────────────────
-# SCRAPING
+# ANTHROPIC WEB SEARCH
 # ─────────────────────────────────────────────
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; NTTDataDefenceBot/1.0; "
-        "+https://www.nttdata.com)"
-    )
-}
+def query_claude_with_search(player_name: str, mercato: str) -> dict:
+    """
+    Usa Claude con web search per estrarre dati strutturati su ogni player.
+    Restituisce un dict con tutti i campi necessari per l'Excel.
+    """
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-def fetch_page(url: str, timeout: int = 15) -> str | None:
+    tipo = "ente pubblico della Difesa italiana" if mercato == "Pubblico" else "azienda privata del settore Difesa italiana"
+
+    prompt = f"""Sei un analista di mercato che lavora per NTT DATA Italia.
+Devi raccogliere informazioni aggiornate su "{player_name}", {tipo}.
+
+Cerca e restituisci SOLO un oggetto JSON valido (niente testo prima o dopo) con questa struttura esatta:
+
+{{
+  "fatturato_ultimo_anno": "valore in €M o €Bn, es: 17.8 Bn€ (2024)",
+  "spesa_it_stimata": "valore o range stimato in €M, es: 320-450 M€",
+  "spesa_it_fonte": "fonte da cui è ricavata la stima (bilancio, piano triennale, ecc.)",
+  "servizi_it_acquistati": ["lista", "dei", "servizi", "IT", "principali"],
+  "piano_strategico_it": "sintesi del piano strategico digitale/IT se disponibile",
+  "gare_recenti": [
+    {{
+      "anno": "2024",
+      "oggetto": "descrizione della gara",
+      "importo": "€M",
+      "cig": "codice CIG se disponibile",
+      "aggiudicatario": "nome azienda o n.d.",
+      "fonte": "URL o fonte"
+    }}
+  ],
+  "trend_futuro": "investimenti IT/digitali previsti o annunciati",
+  "note_rilevanti": "qualsiasi info utile per NTT DATA per posizionarsi"
+}}
+
+Cerca su: bilanci annuali, relazioni finanziarie, portale ANAC/BDNCP, sito ufficiale,
+comunicati stampa, piani industriali, documenti parlamentari, piano triennale IT.
+Per le gare cerca su ANAC con query tipo: "{player_name} gara informatica IT cyber cloud".
+Se un dato non è disponibile usa "n.d." come valore."""
+
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except Exception as e:
-        log.warning(f"Fetch failed {url}: {e}")
-        return None
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            tools=[{"type": "web_search_20250305", "name": "web_search"}],
+            messages=[{"role": "user", "content": prompt}],
+        )
 
+        # Estrai tutto il testo dalla risposta (inclusi i risultati post-tool-use)
+        full_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                full_text += block.text
 
-def extract_text_snippet(html: str, max_chars: int = 800) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(separator=" ")).strip()
-    return text[:max_chars]
+        # Se la risposta è incompleta per tool_use, fai un secondo giro
+        if response.stop_reason == "tool_use":
+            # Costruisci la history completa per il secondo turno
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "Risultati di ricerca ricevuti."
+                    })
 
+            response2 = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                messages=[
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response.content},
+                    {"role": "user", "content": tool_results},
+                ],
+            )
+            for block in response2.content:
+                if hasattr(block, "text"):
+                    full_text += block.text
 
-def extract_financial_keywords(text: str) -> dict:
-    """Cerca keyword finanziarie / IT nel testo di una pagina."""
-    keywords = {
-        "cyber": bool(re.search(r"cyber|sicurezza\s+informatica|cybersecurity", text, re.I)),
-        "cloud": bool(re.search(r"cloud|nuvola\s+informatica", text, re.I)),
-        "data_ai": bool(re.search(r"\bdata\b|intelligenza\s+artificiale|machine\s+learning|AI\b", text, re.I)),
-        "digital_engineering": bool(re.search(r"digital\s+engineering|ingegneria\s+digitale|PLM|MES|ERP", text, re.I)),
-        "gara_appalto": bool(re.search(r"gara|appalto|bando|affidamento|CIG|base\s+d.asta", text, re.I)),
-        "budget_spesa": bool(re.search(r"budget|milion|miliard|mln|mrd|spesa\s+IT|investiment", text, re.I)),
-    }
-    # Prova a estrarre cifre in €M / €Bn
-    amounts = re.findall(r"([\d\.,]+)\s*(?:milioni|miliardi|mln|mrd|bn|B€|M€|\bM\b|\bB\b)", text, re.I)
-    keywords["amounts_found"] = amounts[:5]
-    return keywords
-
-
-def scrape_player(player: dict) -> dict:
-    log.info(f"  Scraping: {player['nome']}")
-    results = {
-        "snippets": [],
-        "keywords_aggregate": {
-            "cyber": False, "cloud": False, "data_ai": False,
-            "digital_engineering": False, "gara_appalto": False, "budget_spesa": False,
-            "amounts_found": [],
-        },
-        "fonti_ok": 0,
-        "fonti_ko": 0,
-        "last_update": datetime.datetime.now().isoformat(),
-    }
-    for url in player["fonti"]:
-        html = fetch_page(url)
-        if html:
-            snippet = extract_text_snippet(html)
-            kw = extract_financial_keywords(snippet)
-            results["snippets"].append({"url": url, "snippet": snippet[:300]})
-            results["fonti_ok"] += 1
-            for k in ["cyber", "cloud", "data_ai", "digital_engineering",
-                      "gara_appalto", "budget_spesa"]:
-                if kw[k]:
-                    results["keywords_aggregate"][k] = True
-            results["keywords_aggregate"]["amounts_found"].extend(kw["amounts_found"])
+        # Estrai JSON dalla risposta
+        json_match = None
+        import re
+        json_match = re.search(r'\{[\s\S]*\}', full_text)
+        if json_match:
+            data = json.loads(json_match.group())
+            log.info(f"  ✓ {player_name}: dati estratti con successo")
+            return data
         else:
-            results["fonti_ko"] += 1
-    return results
+            log.warning(f"  ⚠ {player_name}: JSON non trovato nella risposta")
+            return _empty_record()
+
+    except Exception as e:
+        log.error(f"  ✗ {player_name}: errore API – {e}")
+        return _empty_record()
+
+
+def _empty_record() -> dict:
+    return {
+        "fatturato_ultimo_anno": "n.d.",
+        "spesa_it_stimata": "n.d.",
+        "spesa_it_fonte": "n.d.",
+        "servizi_it_acquistati": [],
+        "piano_strategico_it": "n.d.",
+        "gare_recenti": [],
+        "trend_futuro": "n.d.",
+        "note_rilevanti": "n.d.",
+    }
 
 
 # ─────────────────────────────────────────────
@@ -302,233 +201,238 @@ def save_history(data: dict):
     HIST_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def compute_fingerprint(scrape_result: dict) -> str:
-    blob = json.dumps(scrape_result.get("keywords_aggregate", {}), sort_keys=True)
+def compute_fingerprint(record: dict) -> str:
+    blob = json.dumps({
+        k: record.get(k) for k in
+        ["fatturato_ultimo_anno", "spesa_it_stimata", "gare_recenti", "trend_futuro"]
+    }, sort_keys=True)
     return hashlib.md5(blob.encode()).hexdigest()
 
 
-def compute_diff(player_name: str, today_result: dict, history: dict) -> str:
-    """Restituisce una stringa human-readable del delta rispetto a ieri."""
+def compute_diff(player_name: str, today: dict, history: dict) -> str:
     yesterday = history.get(player_name)
     if not yesterday:
-        return "Prima esecuzione – nessun confronto disponibile"
+        return "Prima esecuzione – baseline acquisita"
 
-    fp_today = compute_fingerprint(today_result)
-    fp_yesterday = yesterday.get("fingerprint", "")
-    if fp_today == fp_yesterday:
-        return "Nessuna variazione rispetto a ieri"
+    fp_today = compute_fingerprint(today)
+    fp_yest  = yesterday.get("fingerprint", "")
+    if fp_today == fp_yest:
+        return "Nessuna variazione vs ieri"
 
     changes = []
-    kw_today = today_result.get("keywords_aggregate", {})
-    kw_yest  = yesterday.get("keywords_aggregate", {})
-    for k in ["cyber", "cloud", "data_ai", "digital_engineering",
-              "gara_appalto", "budget_spesa"]:
-        if kw_today.get(k) != kw_yest.get(k):
-            stato = "rilevato" if kw_today.get(k) else "scomparso"
-            changes.append(f"'{k}' {stato}")
 
-    amounts_new = set(kw_today.get("amounts_found", []))
-    amounts_old = set(kw_yest.get("amounts_found", []))
-    new_a = amounts_new - amounts_old
-    if new_a:
-        changes.append(f"Nuovi importi: {', '.join(new_a)}")
+    if today.get("spesa_it_stimata") != yesterday.get("spesa_it_stimata"):
+        changes.append(f"Spesa IT: {yesterday.get('spesa_it_stimata','?')} → {today.get('spesa_it_stimata','?')}")
 
-    ok_d = today_result.get("fonti_ok", 0) - yesterday.get("fonti_ok", 0)
-    if ok_d != 0:
-        changes.append(f"Fonti raggiungibili: {'+' if ok_d > 0 else ''}{ok_d}")
+    if today.get("fatturato_ultimo_anno") != yesterday.get("fatturato_ultimo_anno"):
+        changes.append(f"Fatturato: aggiornato")
 
-    return " | ".join(changes) if changes else "Modifiche minori non classificate"
+    gare_oggi = len(today.get("gare_recenti", []))
+    gare_ieri = yesterday.get("n_gare", 0)
+    if gare_oggi != gare_ieri:
+        diff_g = gare_oggi - gare_ieri
+        changes.append(f"Gare: {'+' if diff_g > 0 else ''}{diff_g} rispetto a ieri")
+
+    if today.get("trend_futuro") != yesterday.get("trend_futuro"):
+        changes.append("Trend futuro: aggiornato")
+
+    return " | ".join(changes) if changes else "Variazioni minori rilevate"
 
 
 # ─────────────────────────────────────────────
 # EXCEL GENERATION
 # ─────────────────────────────────────────────
-COLOR_HEADER  = "1F3864"   # Navy NTT
+COLOR_HEADER  = "1F3864"
 COLOR_SUBHEAD = "2E75B6"
 COLOR_PUB     = "D9E2F3"
 COLOR_PRIV    = "E2EFDA"
-COLOR_CHANGE  = "FFE599"   # giallo per delta
-COLOR_OK      = "C6EFCE"
-COLOR_KO      = "FFC7CE"
+COLOR_CHANGE  = "FFE599"
 FONT_NAME     = "Arial"
 
 
-def _hdr_style(cell, bg=COLOR_HEADER, fg="FFFFFF", bold=True, size=10):
-    cell.font      = Font(name=FONT_NAME, bold=bold, color=fg, size=size)
+def _hdr(cell, bg=COLOR_HEADER, fg="FFFFFF", size=10):
+    cell.font      = Font(name=FONT_NAME, bold=True, color=fg, size=size)
     cell.fill      = PatternFill("solid", start_color=bg)
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    _border(cell)
 
 
-def _border_all(cell, color="AAAAAA"):
+def _border(cell, color="BBBBBB"):
     s = Side(border_style="thin", color=color)
     cell.border = Border(left=s, right=s, top=s, bottom=s)
 
 
-def build_excel(all_results: list[dict], date_str: str) -> Path:
+def _cell(ws, row, col, value, bg="FFFFFF", bold=False, wrap=True, size=9, color="000000"):
+    c = ws.cell(row=row, column=col, value=value)
+    c.font      = Font(name=FONT_NAME, size=size, bold=bold, color=color)
+    c.fill      = PatternFill("solid", start_color=bg)
+    c.alignment = Alignment(vertical="center", wrap_text=wrap)
+    _border(c)
+    return c
+
+
+def build_excel(all_results: list, date_str: str) -> Path:
     wb = openpyxl.Workbook()
 
-    # ── Sheet 1: Dashboard ────────────────────
+    # ── SHEET 1: DASHBOARD ───────────────────
     ws = wb.active
     ws.title = "Dashboard"
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A4"
 
-    # Title
-    ws.merge_cells("A1:N1")
-    title_cell = ws["A1"]
-    title_cell.value = f"NTT DATA – Market Analysis Difesa  |  Aggiornato: {date_str}"
-    title_cell.font  = Font(name=FONT_NAME, bold=True, size=14, color="FFFFFF")
-    title_cell.fill  = PatternFill("solid", start_color=COLOR_HEADER)
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 30
+    ws.merge_cells("A1:L1")
+    t = ws["A1"]
+    t.value     = f"NTT DATA – Defence Market Intelligence  |  {date_str}"
+    t.font      = Font(name=FONT_NAME, bold=True, size=14, color="FFFFFF")
+    t.fill      = PatternFill("solid", start_color=COLOR_HEADER)
+    t.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 32
 
-    # Legend row
-    ws.merge_cells("A2:N2")
+    ws.merge_cells("A2:L2")
     leg = ws["A2"]
-    leg.value = "🟦 Pubblico   🟩 Privato   🟨 Variazione vs ieri"
-    leg.font  = Font(name=FONT_NAME, size=9, italic=True)
+    leg.value     = "🟦 Pubblico   🟩 Privato   🟨 Variazione rilevata vs ieri"
+    leg.font      = Font(name=FONT_NAME, size=9, italic=True)
     leg.alignment = Alignment(horizontal="center")
 
-    # Column headers
-    headers = [
-        "Player", "Mercato", "Ruolo", "Complessità Proc.",
-        "Fatturato (Bn€)", "Cyber", "Cloud", "Data/AI",
-        "Digital Eng.", "Gare/Appalti", "Budget/Spesa",
-        "Fonti OK/TOT", "Delta vs ieri", "Ultimo aggiornamento",
-    ]
-    col_widths = [28, 10, 38, 16, 14, 8, 8, 8, 12, 12, 12, 12, 42, 20]
+    hdrs = ["Player", "Mercato", "Complessità Proc.", "Fatturato",
+            "Spesa IT Stimata", "Fonte Stima", "Servizi IT Acquistati",
+            "Piano Strategico IT", "N. Gare Trovate", "Trend Futuro",
+            "Delta vs Ieri", "Note per NTT DATA"]
+    widths = [28, 10, 16, 18, 18, 22, 38, 38, 12, 36, 38, 38]
 
-    for ci, (h, w) in enumerate(zip(headers, col_widths), 1):
-        c = ws.cell(row=3, column=ci, value=h)
-        _hdr_style(c, bg=COLOR_SUBHEAD)
-        _border_all(c)
+    for ci, (h, w) in enumerate(zip(hdrs, widths), 1):
+        _hdr(ws.cell(row=3, column=ci), bg=COLOR_SUBHEAD)
+        ws.cell(row=3, column=ci).value = h
         ws.column_dimensions[get_column_letter(ci)].width = w
     ws.row_dimensions[3].height = 36
 
-    # Data rows
     for ri, rec in enumerate(all_results, 4):
         bg = COLOR_PUB if rec["mercato"] == "Pubblico" else COLOR_PRIV
-        kw = rec.get("keywords_aggregate", {})
-
-        def yn(val):
-            return "✔" if val else "–"
-
-        fonti_str = f"{rec.get('fonti_ok',0)}/{rec.get('fonti_ok',0)+rec.get('fonti_ko',0)}"
+        delta_bg = COLOR_CHANGE if "→" in rec["delta"] or "Gare:" in rec["delta"] or "aggiornato" in rec["delta"] else bg
+        servizi = ", ".join(rec["data"].get("servizi_it_acquistati", [])) or "n.d."
         row_vals = [
             rec["nome"],
             rec["mercato"],
-            rec["ruolo"],
             rec["complessita"],
-            rec["fatturato_bn"] if rec["fatturato_bn"] else "n.d.",
-            yn(kw.get("cyber")),
-            yn(kw.get("cloud")),
-            yn(kw.get("data_ai")),
-            yn(kw.get("digital_engineering")),
-            yn(kw.get("gara_appalto")),
-            yn(kw.get("budget_spesa")),
-            fonti_str,
+            rec["data"].get("fatturato_ultimo_anno", "n.d."),
+            rec["data"].get("spesa_it_stimata", "n.d."),
+            rec["data"].get("spesa_it_fonte", "n.d."),
+            servizi,
+            rec["data"].get("piano_strategico_it", "n.d."),
+            str(len(rec["data"].get("gare_recenti", []))),
+            rec["data"].get("trend_futuro", "n.d."),
             rec["delta"],
-            rec.get("last_update", "")[:16].replace("T", " "),
+            rec["data"].get("note_rilevanti", "n.d."),
         ]
-
         for ci, val in enumerate(row_vals, 1):
-            c = ws.cell(row=ri, column=ci, value=val)
-            c.font      = Font(name=FONT_NAME, size=9)
-            c.alignment = Alignment(vertical="center", wrap_text=True)
-            _border_all(c)
-            # background
-            if ci in (6, 7, 8, 9, 10, 11):  # keyword booleans
-                if val == "✔":
-                    c.fill = PatternFill("solid", start_color=COLOR_OK)
-                else:
-                    c.fill = PatternFill("solid", start_color="F4F4F4")
-            elif ci == 13 and "variazione" in rec["delta"].lower().replace("nessuna", ""):
-                c.fill = PatternFill("solid", start_color=COLOR_CHANGE)
-            else:
-                c.fill = PatternFill("solid", start_color=bg)
+            b = delta_bg if ci == 11 else bg
+            _cell(ws, ri, ci, val, bg=b)
+        ws.row_dimensions[ri].height = 52
 
-        ws.row_dimensions[ri].height = 30
+    ws.auto_filter.ref = f"A3:{get_column_letter(len(hdrs))}3"
 
-    # Auto filter
-    ws.auto_filter.ref = f"A3:{get_column_letter(len(headers))}3"
-
-    # ── Sheet 2: Gare & Procurement ───────────
-    ws2 = wb.create_sheet("Gare & Procurement")
+    # ── SHEET 2: STORICO GARE ────────────────
+    ws2 = wb.create_sheet("Storico Gare")
     ws2.sheet_view.showGridLines = False
     ws2.freeze_panes = "A3"
 
-    ws2.merge_cells("A1:F1")
+    ws2.merge_cells("A1:G1")
     t2 = ws2["A1"]
-    t2.value = "Gare e Procurement Difesa – Monitoraggio"
-    t2.font  = Font(name=FONT_NAME, bold=True, size=13, color="FFFFFF")
-    t2.fill  = PatternFill("solid", start_color=COLOR_HEADER)
+    t2.value     = "Storico Gare IT / Cyber / Cloud – Player Difesa"
+    t2.font      = Font(name=FONT_NAME, bold=True, size=13, color="FFFFFF")
+    t2.fill      = PatternFill("solid", start_color=COLOR_HEADER)
     t2.alignment = Alignment(horizontal="center", vertical="center")
-    ws2.row_dimensions[1].height = 26
+    ws2.row_dimensions[1].height = 28
 
-    g_headers = ["Player / Ente", "URL Fonte", "Oggetto / Keyword", "Gara Rilevata",
-                 "Importo Trovato", "Data Rilevazione"]
-    g_widths  = [26, 48, 36, 14, 18, 18]
-    for ci, (h, w) in enumerate(zip(g_headers, g_widths), 1):
-        c = ws2.cell(row=2, column=ci, value=h)
-        _hdr_style(c, bg=COLOR_SUBHEAD)
-        _border_all(c)
+    g_hdrs   = ["Player", "Anno", "Oggetto Gara", "Importo", "CIG", "Aggiudicatario", "Fonte"]
+    g_widths = [26, 8, 52, 14, 20, 28, 42]
+    for ci, (h, w) in enumerate(zip(g_hdrs, g_widths), 1):
+        _hdr(ws2.cell(row=2, column=ci), bg=COLOR_SUBHEAD)
+        ws2.cell(row=2, column=ci).value = h
         ws2.column_dimensions[get_column_letter(ci)].width = w
 
-    fill_light = PatternFill("solid", start_color="EEF2FF")
-    for ri, rec in enumerate(all_results, 3):
-        kw = rec.get("keywords_aggregate", {})
-        importi = ", ".join(kw.get("amounts_found", [])) or "–"
-        row_v = [
-            rec["nome"],
-            rec["fonti_principali"],
-            ", ".join(rec.get("servizi_it", [])),
-            "✔" if kw.get("gara_appalto") else "–",
-            importi,
-            rec.get("last_update", "")[:16].replace("T", " "),
-        ]
-        for ci, val in enumerate(row_v, 1):
-            c = ws2.cell(row=ri, column=ci, value=val)
-            c.font      = Font(name=FONT_NAME, size=9)
-            c.alignment = Alignment(vertical="center", wrap_text=True)
-            _border_all(c)
-            c.fill = fill_light
-        ws2.row_dimensions[ri].height = 28
-
-    # ── Sheet 3: Fonti & Metodologia ─────────
-    ws3 = wb.create_sheet("Fonti & Metodologia")
-    ws3.column_dimensions["A"].width = 26
-    ws3.column_dimensions["B"].width = 70
-    ws3.column_dimensions["C"].width = 40
-
-    ws3.merge_cells("A1:C1")
-    t3 = ws3["A1"]
-    t3.value = "Fonti di ricerca per player – Metodologia 8 piste"
-    t3.font  = Font(name=FONT_NAME, bold=True, size=13, color="FFFFFF")
-    t3.fill  = PatternFill("solid", start_color=COLOR_HEADER)
-    t3.alignment = Alignment(horizontal="center", vertical="center")
-    ws3.row_dimensions[1].height = 26
-
-    for ci, h in enumerate(["Player", "URL Fonte", "Tipo pista"], 1):
-        c = ws3.cell(row=2, column=ci, value=h)
-        _hdr_style(c, bg=COLOR_SUBHEAD)
-
     row_i = 3
-    for rec in all_results:
-        for url in rec.get("fonti_list", []):
-            pista = "Procurement/Gare" if any(k in url for k in ["anac", "difesaservizi", "gare", "bdncp"]) \
-                else "Industriale/Bilancio" if any(k in url for k in ["leonardo", "fincantieri", "mbda", "eltgroup", "avioaero", "thalesalenia"]) \
-                else "Normativa/Pubblica"
-            for ci, val in enumerate([rec["nome"], url, pista], 1):
-                c = ws3.cell(row=row_i, column=ci, value=val)
+    fill_a = PatternFill("solid", start_color="EEF2FF")
+    fill_b = PatternFill("solid", start_color="F8F9FF")
+    for idx, rec in enumerate(all_results):
+        gare = rec["data"].get("gare_recenti", [])
+        if not gare:
+            c = ws2.cell(row=row_i, column=1, value=rec["nome"])
+            c.font = Font(name=FONT_NAME, size=9, italic=True, color="888888")
+            ws2.cell(row=row_i, column=2, value="–")
+            ws2.cell(row=row_i, column=3, value="Nessuna gara trovata")
+            for ci in range(1, 8):
+                _border(ws2.cell(row=row_i, column=ci))
+                ws2.cell(row=row_i, column=ci).fill = fill_b
+            row_i += 1
+            continue
+        fill = fill_a if idx % 2 == 0 else fill_b
+        for g in gare:
+            vals = [
+                rec["nome"],
+                g.get("anno", "n.d."),
+                g.get("oggetto", "n.d."),
+                g.get("importo", "n.d."),
+                g.get("cig", "n.d."),
+                g.get("aggiudicatario", "n.d."),
+                g.get("fonte", "n.d."),
+            ]
+            for ci, val in enumerate(vals, 1):
+                c = ws2.cell(row=row_i, column=ci, value=val)
                 c.font      = Font(name=FONT_NAME, size=9)
-                c.alignment = Alignment(vertical="center")
-                _border_all(c)
-                if ci == 2:
-                    c.hyperlink = url
-                    c.font = Font(name=FONT_NAME, size=9, color="0563C1", underline="single")
+                c.fill      = fill
+                c.alignment = Alignment(vertical="center", wrap_text=True)
+                _border(c)
+            ws2.row_dimensions[row_i].height = 28
             row_i += 1
 
-    # ── Save ──────────────────────────────────
+    ws2.auto_filter.ref = f"A2:{get_column_letter(len(g_hdrs))}2"
+
+    # ── SHEET 3: DETTAGLIO PLAYER ────────────
+    ws3 = wb.create_sheet("Dettaglio Player")
+    ws3.sheet_view.showGridLines = False
+    ws3.column_dimensions["A"].width = 28
+    ws3.column_dimensions["B"].width = 80
+
+    ws3.merge_cells("A1:B1")
+    t3 = ws3["A1"]
+    t3.value     = "Scheda Dettaglio per Player"
+    t3.font      = Font(name=FONT_NAME, bold=True, size=13, color="FFFFFF")
+    t3.fill      = PatternFill("solid", start_color=COLOR_HEADER)
+    t3.alignment = Alignment(horizontal="center", vertical="center")
+    ws3.row_dimensions[1].height = 28
+
+    row_i = 2
+    for rec in all_results:
+        bg = COLOR_PUB if rec["mercato"] == "Pubblico" else COLOR_PRIV
+        # Intestazione player
+        ws3.merge_cells(f"A{row_i}:B{row_i}")
+        c = ws3.cell(row=row_i, column=1, value=f"▶  {rec['nome']}  ({rec['mercato']})")
+        c.font      = Font(name=FONT_NAME, bold=True, size=11, color="FFFFFF")
+        c.fill      = PatternFill("solid", start_color=COLOR_SUBHEAD)
+        c.alignment = Alignment(vertical="center")
+        ws3.row_dimensions[row_i].height = 24
+        row_i += 1
+
+        d = rec["data"]
+        fields = [
+            ("Fatturato",             d.get("fatturato_ultimo_anno", "n.d.")),
+            ("Spesa IT Stimata",      d.get("spesa_it_stimata", "n.d.")),
+            ("Fonte Stima",           d.get("spesa_it_fonte", "n.d.")),
+            ("Servizi IT Acquistati", ", ".join(d.get("servizi_it_acquistati", []))),
+            ("Piano Strategico IT",   d.get("piano_strategico_it", "n.d.")),
+            ("Trend Futuro",          d.get("trend_futuro", "n.d.")),
+            ("Note per NTT DATA",     d.get("note_rilevanti", "n.d.")),
+            ("N. Gare Trovate",       str(len(d.get("gare_recenti", [])))),
+        ]
+        for label, val in fields:
+            _cell(ws3, row_i, 1, label, bg=bg, bold=True)
+            _cell(ws3, row_i, 2, val,   bg="FFFFFF")
+            ws3.row_dimensions[row_i].height = 36
+            row_i += 1
+        row_i += 1  # riga vuota tra player
+
+    # ── SAVE ─────────────────────────────────
     fname = OUTPUT_DIR / f"defence_market_{date_str.replace('-', '')}.xlsx"
     wb.save(fname)
     log.info(f"Excel salvato: {fname}")
@@ -538,97 +442,68 @@ def build_excel(all_results: list[dict], date_str: str) -> Path:
 # ─────────────────────────────────────────────
 # EMAIL
 # ─────────────────────────────────────────────
-def build_email_html(all_results: list[dict], date_str: str) -> str:
-    rows_html = ""
-    changed = sum(
-        1 for r in all_results
-        if "variazione" in r["delta"].lower() or "nuovo" in r["delta"].lower()
-    )
-    ok_pct = round(
-        100 * sum(r.get("fonti_ok", 0) for r in all_results) /
-        max(sum(r.get("fonti_ok", 0) + r.get("fonti_ko", 0) for r in all_results), 1)
-    )
+def build_email_html(all_results: list, date_str: str) -> str:
+    changed   = sum(1 for r in all_results if "→" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"])
+    tot_gare  = sum(len(r["data"].get("gare_recenti", [])) for r in all_results)
+    con_spesa = sum(1 for r in all_results if r["data"].get("spesa_it_stimata", "n.d.") != "n.d.")
 
+    rows = ""
     for r in all_results:
-        badge_color = "#c6efce" if r["mercato"] == "Pubblico" else "#e2efda"
-        delta_bg    = "#FFE599" if (
-            "variazione" in r["delta"].lower() or "nuovo" in r["delta"].lower()
-        ) else "#FFFFFF"
-        kw = r.get("keywords_aggregate", {})
-        def dot(v):
-            return "🟢" if v else "⚪"
-        rows_html += f"""
+        delta_bg = "#FFE599" if ("→" in r["delta"] or "aggiornato" in r["delta"] or "Gare:" in r["delta"]) else "#FFFFFF"
+        badge    = "#D9E2F3" if r["mercato"] == "Pubblico" else "#E2EFDA"
+        rows += f"""
         <tr>
-          <td style="padding:6px 8px;border:1px solid #ddd;background:{badge_color};font-weight:600">{r['nome']}</td>
+          <td style="padding:6px 8px;border:1px solid #ddd;background:{badge};font-weight:600">{r['nome']}</td>
           <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{r['mercato']}</td>
-          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{dot(kw.get('cyber'))}</td>
-          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{dot(kw.get('cloud'))}</td>
-          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{dot(kw.get('data_ai'))}</td>
-          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{dot(kw.get('gara_appalto'))}</td>
-          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{r.get('fonti_ok',0)}/{r.get('fonti_ok',0)+r.get('fonti_ko',0)}</td>
+          <td style="padding:6px 8px;border:1px solid #ddd">{r['data'].get('fatturato_ultimo_anno','n.d.')}</td>
+          <td style="padding:6px 8px;border:1px solid #ddd;font-weight:600;color:#1F3864">{r['data'].get('spesa_it_stimata','n.d.')}</td>
+          <td style="padding:6px 8px;border:1px solid #ddd;text-align:center">{len(r['data'].get('gare_recenti',[]))}</td>
           <td style="padding:6px 8px;border:1px solid #ddd;background:{delta_bg};font-size:11px">{r['delta']}</td>
         </tr>"""
 
-    return f"""
-<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="font-family:Arial,sans-serif;color:#1F3864;margin:0;padding:20px">
-  <div style="max-width:900px;margin:auto">
-    <div style="background:#1F3864;padding:18px 24px;border-radius:8px 8px 0 0">
-      <h1 style="color:#fff;margin:0;font-size:18px">
-        NTT DATA – Defence Market Analysis
-      </h1>
-      <p style="color:#aac4e8;margin:4px 0 0;font-size:13px">
-        Report giornaliero · {date_str}
-      </p>
-    </div>
-
-    <!-- Summary boxes -->
-    <div style="background:#f0f4fa;padding:16px 24px;display:flex;gap:20px;flex-wrap:wrap">
-      <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #2E75B6;min-width:130px">
-        <div style="font-size:24px;font-weight:700;color:#2E75B6">{len(all_results)}</div>
-        <div style="font-size:12px;color:#555">Player monitorati</div>
-      </div>
-      <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #FF8C00;min-width:130px">
-        <div style="font-size:24px;font-weight:700;color:#FF8C00">{changed}</div>
-        <div style="font-size:12px;color:#555">Con variazioni vs ieri</div>
-      </div>
-      <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #70AD47;min-width:130px">
-        <div style="font-size:24px;font-weight:700;color:#70AD47">{ok_pct}%</div>
-        <div style="font-size:12px;color:#555">Fonti raggiungibili</div>
-      </div>
-      <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #7030A0;min-width:130px">
-        <div style="font-size:24px;font-weight:700;color:#7030A0">
-          {sum(1 for r in all_results if r.get('keywords_aggregate',{}).get('gara_appalto'))}
-        </div>
-        <div style="font-size:12px;color:#555">Con gare rilevate</div>
-      </div>
-    </div>
-
-    <!-- Main table -->
-    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-top:0">
-      <thead>
-        <tr style="background:#2E75B6;color:#fff">
-          <th style="padding:8px;border:1px solid #1a5c9e;text-align:left">Player</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Mercato</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Cyber</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Cloud</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Data/AI</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Gare</th>
-          <th style="padding:8px;border:1px solid #1a5c9e">Fonti</th>
-          <th style="padding:8px;border:1px solid #1a5c9e;min-width:200px">Delta vs ieri</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-
-    <p style="font-size:11px;color:#888;margin-top:16px">
-      In allegato trovi il file Excel con il dettaglio completo (Dashboard, Gare &amp; Procurement, Fonti &amp; Metodologia).<br>
-      🟡 Celle gialle nella colonna "Delta" = variazione rilevata rispetto all'esecuzione precedente.
-    </p>
-    <p style="font-size:11px;color:#bbb">
-      Script autogenerato da <strong>NTT DATA Defence Market Scraper</strong> – esecuzione automatica quotidiana.
-    </p>
+<div style="max-width:860px;margin:auto">
+  <div style="background:#1F3864;padding:18px 24px;border-radius:8px 8px 0 0">
+    <h1 style="color:#fff;margin:0;font-size:18px">NTT DATA – Defence Market Intelligence</h1>
+    <p style="color:#aac4e8;margin:4px 0 0;font-size:13px">Report giornaliero · {date_str}</p>
   </div>
+  <div style="background:#f0f4fa;padding:16px 24px;display:flex;gap:16px;flex-wrap:wrap">
+    <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #2E75B6">
+      <div style="font-size:24px;font-weight:700;color:#2E75B6">{len(all_results)}</div>
+      <div style="font-size:12px;color:#555">Player monitorati</div>
+    </div>
+    <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #70AD47">
+      <div style="font-size:24px;font-weight:700;color:#70AD47">{con_spesa}</div>
+      <div style="font-size:12px;color:#555">Con stima spesa IT</div>
+    </div>
+    <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #7030A0">
+      <div style="font-size:24px;font-weight:700;color:#7030A0">{tot_gare}</div>
+      <div style="font-size:12px;color:#555">Gare trovate totali</div>
+    </div>
+    <div style="background:#fff;border-radius:6px;padding:12px 20px;border-left:4px solid #FF8C00">
+      <div style="font-size:24px;font-weight:700;color:#FF8C00">{changed}</div>
+      <div style="font-size:12px;color:#555">Variazioni vs ieri</div>
+    </div>
+  </div>
+  <table style="width:100%;border-collapse:collapse;font-size:12px">
+    <thead>
+      <tr style="background:#2E75B6;color:#fff">
+        <th style="padding:8px;border:1px solid #1a5c9e;text-align:left">Player</th>
+        <th style="padding:8px;border:1px solid #1a5c9e">Mercato</th>
+        <th style="padding:8px;border:1px solid #1a5c9e">Fatturato</th>
+        <th style="padding:8px;border:1px solid #1a5c9e">Spesa IT Stimata</th>
+        <th style="padding:8px;border:1px solid #1a5c9e">N. Gare</th>
+        <th style="padding:8px;border:1px solid #1a5c9e;min-width:180px">Delta vs Ieri</th>
+      </tr>
+    </thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <p style="font-size:11px;color:#888;margin-top:16px">
+    In allegato: Excel con Dashboard, Storico Gare completo e Schede Dettaglio per player.<br>
+    🟨 Sfondo giallo = variazione rilevata rispetto all'esecuzione precedente.
+  </p>
+</div>
 </body></html>"""
 
 
@@ -636,103 +511,79 @@ def send_email(xlsx_path: Path, html_body: str, date_str: str):
     if not SMTP_USER or not SMTP_PASS:
         log.warning("Credenziali SMTP non configurate – mail non inviata.")
         return
-
     msg = MIMEMultipart("mixed")
     msg["From"]    = SMTP_USER
     msg["To"]      = RECIPIENT_EMAIL
-    msg["Subject"] = f"[Defence Market] Report giornaliero – {date_str}"
-
+    msg["Subject"] = f"[Defence Market] Report {date_str}"
     msg.attach(MIMEText(html_body, "html", "utf-8"))
-
     with open(xlsx_path, "rb") as f:
-        part = MIMEBase("application",
-                        "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         part.set_payload(f.read())
     encoders.encode_base64(part)
-    part.add_header("Content-Disposition",
-                    f'attachment; filename="{xlsx_path.name}"')
+    part.add_header("Content-Disposition", f'attachment; filename="{xlsx_path.name}"')
     msg.attach(part)
-
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, RECIPIENT_EMAIL, msg.as_string())
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+            s.ehlo(); s.starttls(); s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, RECIPIENT_EMAIL, msg.as_string())
         log.info(f"Mail inviata a {RECIPIENT_EMAIL}")
     except Exception as e:
         log.error(f"Errore invio mail: {e}")
 
 
 # ─────────────────────────────────────────────
-# MAIN RUN
+# MAIN
 # ─────────────────────────────────────────────
 def run():
     date_str = datetime.date.today().isoformat()
     log.info(f"=== Esecuzione {date_str} ===")
 
-    history = load_history()
+    history     = load_history()
     all_results = []
 
     for player in PLAYERS:
-        scrape = scrape_player(player)
-        fp     = compute_fingerprint(scrape)
-        delta  = compute_diff(player["nome"], scrape, history)
+        log.info(f"  Ricerca: {player['nome']}")
+        data  = query_claude_with_search(player["nome"], player["mercato"])
+        delta = compute_diff(player["nome"], data, history)
+        fp    = compute_fingerprint(data)
 
-        # aggiorna storia
         history[player["nome"]] = {
-            "fingerprint":        fp,
-            "keywords_aggregate": scrape["keywords_aggregate"],
-            "fonti_ok":           scrape["fonti_ok"],
-            "date":               date_str,
+            "fingerprint":         fp,
+            "spesa_it_stimata":    data.get("spesa_it_stimata"),
+            "fatturato_ultimo_anno": data.get("fatturato_ultimo_anno"),
+            "trend_futuro":        data.get("trend_futuro"),
+            "n_gare":              len(data.get("gare_recenti", [])),
+            "date":                date_str,
         }
-
         all_results.append({
-            "nome":            player["nome"],
-            "mercato":         player["mercato"],
-            "ruolo":           player["ruolo"],
-            "complessita":     player["complessita_procurement"],
-            "fatturato_bn":    player["fatturato_bn"],
-            "servizi_it":      player["servizi_it"],
-            "fonti_list":      player["fonti"],
-            "fonti_principali": player["fonti"][0] if player["fonti"] else "",
-            "keywords_aggregate": scrape["keywords_aggregate"],
-            "fonti_ok":        scrape["fonti_ok"],
-            "fonti_ko":        scrape["fonti_ko"],
-            "last_update":     scrape["last_update"],
-            "delta":           delta,
+            "nome":       player["nome"],
+            "mercato":    player["mercato"],
+            "complessita": player["complessita"],
+            "data":       data,
+            "delta":      delta,
         })
+        time.sleep(3)  # evita rate limiting
 
     save_history(history)
-
-    xlsx_path  = build_excel(all_results, date_str)
-    html_body  = build_email_html(all_results, date_str)
+    xlsx_path = build_excel(all_results, date_str)
+    html_body = build_email_html(all_results, date_str)
     send_email(xlsx_path, html_body, date_str)
-
     log.info("=== Fine esecuzione ===")
     return xlsx_path
 
 
-# ─────────────────────────────────────────────
-# SCHEDULER (opzionale – gira a ciclo continuo)
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-
-    # Esecuzione immediata singola:
     if "--once" in sys.argv:
         run()
     else:
-        # Schedule alle 07:30 ogni giorno
         try:
             import schedule
-            log.info("Scheduler attivo. Prossima esecuzione alle 07:30.")
+            log.info("Scheduler attivo – esecuzione ogni giorno alle 07:30.")
             schedule.every().day.at("07:30").do(run)
-            # Prima esecuzione immediata
             run()
             while True:
                 schedule.run_pending()
                 time.sleep(60)
         except ImportError:
-            log.warning("'schedule' non installato – esecuzione singola.")
             run()
