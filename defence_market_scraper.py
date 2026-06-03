@@ -1,4 +1,4 @@
-"""
+""" 
 Defence Market Analysis – NTT DATA Italy
 Script giornaliero con Anthropic API + web search integrato.
 Raccoglie: budget IT, spesa digitale, storico gare ANAC per ogni player.
