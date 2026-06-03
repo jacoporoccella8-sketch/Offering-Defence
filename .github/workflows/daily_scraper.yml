@@ -1,4 +1,4 @@
-name: Defence Market – Daily Scraper
+name: Defence Market Daily Scraper
 
 on:
   schedule:
