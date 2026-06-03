@@ -22,14 +22,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scraper
-        env:
-          SMTP_HOST:        ${{ secrets.SMTP_HOST }}
-          SMTP_PORT:        ${{ secrets.SMTP_PORT }}
-          SMTP_USER:        ${{ secrets.SMTP_USER }}
-          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
-          RECIPIENT_EMAIL:  ${{ secrets.RECIPIENT_EMAIL }}
-        run: python defence_market_scraper.py --once
+          - name: Run scraper
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        SMTP_HOST:         ${{ secrets.SMTP_HOST }}
+        SMTP_PORT:         ${{ secrets.SMTP_PORT }}
+        SMTP_USER:         ${{ secrets.SMTP_USER }}
+        SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+        RECIPIENT_EMAIL:   ${{ secrets.RECIPIENT_EMAIL }}
+      run: python defence_market_scraper.py --once
 
       - name: Upload Excel output as artifact
         uses: actions/upload-artifact@v4
